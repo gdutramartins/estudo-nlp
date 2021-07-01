@@ -1,0 +1,410 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "!pip install transformers\n",
+    "!pip install nlp\n",
+    "!pip install sentencepiece"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import logging\n",
+    "from dataclasses import dataclass, field\n",
+    "from typing import Dict, List, Optional\n",
+    "\n",
+    "import torch\n",
+    "import nlp\n",
+    "from transformers import T5Tokenizer, BartTokenizer, HfArgumentParser"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "logger = logging.getLogger(__name__)\n",
+    "logging.basicConfig(\n",
+    "        format=\"%(asctime)s - %(levelname)s - %(name)s -   %(message)s\",\n",
+    "        datefmt=\"%m/%d/%Y %H:%M:%S\",\n",
+    "        level=logging.INFO\n",
+    "    )\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def filter_qa(example):\n",
+    "    return example['task'] == 'qa'\n",
+    "\n",
+    "def filter_qg(example):\n",
+    "    return example['task'] == 'qg'\n",
+    "\n",
+    "def filter_e2e_qg(example):\n",
+    "    return example['task'] == 'e2e_qg'\n",
+    "\n",
+    "def filter_ans_ext(example):\n",
+    "    return example['task'] == 'ans_ext'\n",
+    "\n",
+    "def filter_multi(example):\n",
+    "    return example['task'] != 'e2e_qg'\n",
+    "\n",
+    "\n",
+    "TASK_TO_FILTER_FN = {\n",
+    "    'qa': filter_qa,\n",
+    "    'qg': filter_qg,\n",
+    "    'e2e_qg': filter_e2e_qg,\n",
+    "    'ans_ext': filter_ans_ext,\n",
+    "    'multi': filter_multi\n",
+    "}"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@dataclass\n",
+    "class DataTrainingArguments:\n",
+    "    \"\"\"\n",
+    "    Arguments pertaining to what data we are going to input our model for training and eval.\n",
+    "    \"\"\"\n",
+    "    task: str = field(\n",
+    "        metadata={\"help\": \"Which task 'qa', 'qg', 'e2e_qg', 'ans_ext', 'multi'. 'multi' means 'qa', 'qg', 'ans_ext' tasks\"}, \n",
+    "    )\n",
+    "    model_type: str = field(metadata={\"help\": \"One of 't5', 'bart'\"})\n",
+    "    dataset_path: Optional[str] = field(\n",
+    "        default=\"data/squad_multitask\",\n",
+    "        metadata={\"help\": \"Path for dataset directory\"}, \n",
+    "    )\n",
+    "    train_file_name: Optional[str] = field(\n",
+    "        default=None,\n",
+    "        metadata={\"help\": \"name for cached train dataset\"},\n",
+    "    )\n",
+    "    valid_file_name: Optional[str] = field(\n",
+    "        default=None,\n",
+    "        metadata={\"help\": \"name for cached valid dataset\"},\n",
+    "    )\n",
+    "    valid_for_qg_only: bool = field(\n",
+    "        default=False,\n",
+    "        metadata={\"help\": \"For multitask dataset valid split should contain only qg task or all tasks.\"}\n",
+    "    )\n",
+    "    qg_format: Optional[str] = field(\n",
+    "        default='highlight_qg_format',\n",
+    "        metadata={\"help\": \"How to format inputs for que generation, 'highlight_qg_format' or 'prepend_qg_format'\"}, \n",
+    "    )\n",
+    "    max_source_length: Optional[int] = field(\n",
+    "        default=512,\n",
+    "        metadata={\"help\": \"Max input length for the source text\"},\n",
+    "    )\n",
+    "    max_target_length: Optional[int] = field(\n",
+    "        default=32,\n",
+    "        metadata={\"help\": \"Max input length for the target text\"},\n",
+    "    )\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class DataProcessor:\n",
+    "    def __init__(self, tokenizer, model_type=\"t5\", max_source_length=512, max_target_length=32):\n",
+    "        self.tokenizer = tokenizer\n",
+    "        self.max_source_length = max_source_length\n",
+    "        self.max_target_length = max_target_length\n",
+    "        self.model_type = model_type\n",
+    "        self.hl_token = \"<hl>\"\n",
+    "        \n",
+    "        if model_type == \"t5\":\n",
+    "            self.sep_token = \"<sep>\"\n",
+    "        elif model_type == \"bart\":\n",
+    "            self.sep_token = \"<sep>\"\n",
+    "        else:\n",
+    "            self.sep_token = \"[SEP]\"\n",
+    "  \n",
+    "    def process(self, dataset):\n",
+    "        if self.model_type == \"t5\":\n",
+    "            dataset = dataset.map(self._add_eos_examples)\n",
+    "        \n",
+    "        dataset = dataset.map(self._add_special_tokens)\n",
+    "        dataset = dataset.map(self._convert_to_features, batched=True)\n",
+    "        \n",
+    "        return dataset\n",
+    "  \n",
+    "    def _add_eos_examples(self, example):\n",
+    "        example['source_text'] = example['source_text'] + \" </s>\"\n",
+    "        example['target_text'] = example['target_text'] + \" </s>\"\n",
+    "        return example\n",
+    "  \n",
+    "    def _add_special_tokens(self, example):\n",
+    "        example['source_text'] = example['source_text'].replace(\"{hl_token}\", self.hl_token)    \n",
+    "        example['target_text'] = example['target_text'].replace(\"{sep_token}\", self.sep_token)\n",
+    "        return example\n",
+    "  \n",
+    "    # tokenize the examples\n",
+    "    def _convert_to_features(self, example_batch):\n",
+    "        source_encoding = self.tokenizer.batch_encode_plus(\n",
+    "            example_batch['source_text'],\n",
+    "            max_length=self.max_source_length,\n",
+    "            padding='max_length',\n",
+    "            pad_to_max_length=True,\n",
+    "            truncation=True, \n",
+    "        )\n",
+    "        target_encoding = self.tokenizer.batch_encode_plus(\n",
+    "            example_batch['target_text'],\n",
+    "            max_length=self.max_target_length,\n",
+    "            padding='max_length',\n",
+    "            pad_to_max_length=True,\n",
+    "            truncation=True, \n",
+    "        )\n",
+    "\n",
+    "        encodings = {\n",
+    "            'source_ids': source_encoding['input_ids'], \n",
+    "            'target_ids': target_encoding['input_ids'],\n",
+    "            'attention_mask': source_encoding['attention_mask'],\n",
+    "        }\n",
+    "\n",
+    "        return encodings\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "data_args = DataTrainingArguments(task= 'e2e_qg',\n",
+    "                                  model_type='t5',\n",
+    "                                  dataset_path= 'data/squad_multitask/',\n",
+    "                                  qg_format= 'highlight_qg_format',\n",
+    "                                  train_file_name= 'train_data_e2e_qg_t5.pt',\n",
+    "                                  valid_file_name= 'valid_data_e2e_qg_t5.pt',\n",
+    "                                  valid_for_qg_only= True,\n",
+    "                                  max_source_length= 512, \n",
+    "                                  max_target_length=32)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "execute_result",
+     "data": {
+      "text/plain": [
+       "2"
+      ]
+     },
+     "metadata": {},
+     "execution_count": 6
+    }
+   ],
+   "source": [
+    "if data_args.model_type == 't5':\n",
+    "    tokenizer = T5Tokenizer.from_pretrained(\"t5-base\")\n",
+    "else:\n",
+    "    tokenizer = BartTokenizer.from_pretrained(\"facebook/bart-base\")\n",
+    "\n",
+    "tokenizer.add_tokens(['<sep>', '<hl>'])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "text": [
+      "06/22/2021 06:00:01 - INFO - nlp.load -   Checking data/squad_multitask/squad_multitask.py for additional imports.\n",
+      "06/22/2021 06:00:02 - INFO - filelock -   Lock 2291960822176 acquired on data/squad_multitask/squad_multitask.py.lock\n",
+      "06/22/2021 06:00:02 - INFO - nlp.load -   Found main folder for dataset data/squad_multitask/squad_multitask.py at C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\n",
+      "06/22/2021 06:00:02 - INFO - nlp.load -   Found specific version folder for dataset data/squad_multitask/squad_multitask.py at C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\n",
+      "06/22/2021 06:00:02 - INFO - nlp.load -   Found script file from data/squad_multitask/squad_multitask.py to C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\squad_multitask.py\n",
+      "06/22/2021 06:00:02 - INFO - nlp.load -   Found dataset infos file from data/squad_multitask\\dataset_infos.json to C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\dataset_infos.json\n",
+      "06/22/2021 06:00:02 - INFO - nlp.load -   Found metadata file for dataset data/squad_multitask/squad_multitask.py at C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\squad_multitask.json\n",
+      "06/22/2021 06:00:02 - INFO - filelock -   Lock 2291960822176 released on data/squad_multitask/squad_multitask.py.lock\n",
+      "[nltk_data] Downloading package punkt to\n",
+      "[nltk_data]     C:\\Users\\gdutr\\AppData\\Roaming\\nltk_data...\n",
+      "[nltk_data]   Package punkt is already up-to-date!\n",
+      "06/22/2021 06:00:02 - INFO - nlp.info -   Loading Dataset Infos from C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\n",
+      "06/22/2021 06:00:02 - INFO - nlp.builder -   Overwrite dataset info from restored data version.\n",
+      "06/22/2021 06:00:02 - INFO - nlp.info -   Loading Dataset info from C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\n",
+      "06/22/2021 06:00:02 - INFO - nlp.builder -   Reusing dataset squad_multitask (C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd)\n",
+      "06/22/2021 06:00:02 - INFO - nlp.builder -   Constructing Dataset for split train, from C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\n",
+      "06/22/2021 06:00:02 - INFO - nlp.utils.info_utils -   All the checksums matched successfully for post processing resources\n"
+     ]
+    }
+   ],
+   "source": [
+    "train_dataset = nlp.load_dataset(data_args.dataset_path, name=data_args.qg_format, split=nlp.Split.TRAIN)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "text": [
+      "06/22/2021 06:00:07 - INFO - nlp.load -   Checking data/squad_multitask/squad_multitask.py for additional imports.\n",
+      "06/22/2021 06:00:07 - INFO - filelock -   Lock 2293484081552 acquired on data/squad_multitask/squad_multitask.py.lock\n",
+      "06/22/2021 06:00:07 - INFO - nlp.load -   Found main folder for dataset data/squad_multitask/squad_multitask.py at C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\n",
+      "06/22/2021 06:00:07 - INFO - nlp.load -   Found specific version folder for dataset data/squad_multitask/squad_multitask.py at C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\n",
+      "06/22/2021 06:00:07 - INFO - nlp.load -   Found script file from data/squad_multitask/squad_multitask.py to C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\squad_multitask.py\n",
+      "06/22/2021 06:00:07 - INFO - nlp.load -   Found dataset infos file from data/squad_multitask\\dataset_infos.json to C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\dataset_infos.json\n",
+      "06/22/2021 06:00:07 - INFO - nlp.load -   Found metadata file for dataset data/squad_multitask/squad_multitask.py at C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\squad_multitask.json\n",
+      "06/22/2021 06:00:07 - INFO - filelock -   Lock 2293484081552 released on data/squad_multitask/squad_multitask.py.lock\n",
+      "06/22/2021 06:00:07 - INFO - nlp.info -   Loading Dataset Infos from C:\\Users\\gdutr\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\datasets\\squad_multitask\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\n",
+      "06/22/2021 06:00:07 - INFO - nlp.builder -   Overwrite dataset info from restored data version.\n",
+      "06/22/2021 06:00:07 - INFO - nlp.info -   Loading Dataset info from C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\n",
+      "06/22/2021 06:00:07 - INFO - nlp.builder -   Reusing dataset squad_multitask (C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd)\n",
+      "06/22/2021 06:00:07 - INFO - nlp.builder -   Constructing Dataset for split validation, from C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\n",
+      "06/22/2021 06:00:07 - INFO - nlp.utils.info_utils -   All the checksums matched successfully for post processing resources\n"
+     ]
+    }
+   ],
+   "source": [
+    "valid_dataset = nlp.load_dataset(data_args.dataset_path, name=data_args.qg_format, split=nlp.Split.VALIDATION)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "text": [
+      "06/22/2021 06:00:23 - INFO - nlp.arrow_dataset -   Loading cached processed dataset at C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\cache-0a999283decf93f934bb849d4f94ff6a.arrow\n"
+     ]
+    }
+   ],
+   "source": [
+    "train_dataset = train_dataset.filter(TASK_TO_FILTER_FN[data_args.task])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "text": [
+      "06/22/2021 06:00:25 - INFO - nlp.arrow_dataset -   Loading cached processed dataset at C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\cache-f7cb6f78f167ebb104398f59c4875923.arrow\n"
+     ]
+    }
+   ],
+   "source": [
+    "valid_dataset = valid_dataset.filter(TASK_TO_FILTER_FN[data_args.task])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "processor = DataProcessor(\n",
+    "        tokenizer,\n",
+    "        model_type=data_args.model_type,\n",
+    "        max_source_length=data_args.max_source_length,\n",
+    "        max_target_length=data_args.max_target_length\n",
+    "    )"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [
+    {
+     "output_type": "stream",
+     "name": "stderr",
+     "text": [
+      "06/22/2021 06:00:59 - INFO - nlp.arrow_dataset -   Loading cached processed dataset at C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\cache-ecf398df07c6fa9d443b38a7a2ee4606.arrow\n",
+      "06/22/2021 06:00:59 - INFO - nlp.arrow_dataset -   Caching processed dataset at C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\cache-5ac1f5b88a8836dc0e712f2b9e291dbe.arrow\n",
+      "100%|██████████| 18896/18896 [00:00<00:00, 36894.37it/s]\n",
+      "06/22/2021 06:00:59 - INFO - nlp.arrow_writer -   Done writing 18896 examples in 20623893 bytes C:\\Users\\gdutr\\.cache\\huggingface\\datasets\\squad_multitask\\highlight_qg_format\\1.0.0\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\tmpc1a8qr7c.\n"
+     ]
+    },
+    {
+     "output_type": "error",
+     "ename": "PermissionError",
+     "evalue": "[WinError 32] O arquivo já está sendo usado por outro processo: 'C:\\\\Users\\\\gdutr\\\\.cache\\\\huggingface\\\\datasets\\\\squad_multitask\\\\highlight_qg_format\\\\1.0.0\\\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\\\tmpc1a8qr7c'",
+     "traceback": [
+      "\u001b[1;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[1;31mPermissionError\u001b[0m                           Traceback (most recent call last)",
+      "\u001b[1;32m~\\miniconda3\\envs\\nlp-gpu\\lib\\shutil.py\u001b[0m in \u001b[0;36mmove\u001b[1;34m(src, dst, copy_function)\u001b[0m\n\u001b[0;32m    790\u001b[0m     \u001b[1;32mtry\u001b[0m\u001b[1;33m:\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[1;32m--> 791\u001b[1;33m         \u001b[0mos\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0mrename\u001b[0m\u001b[1;33m(\u001b[0m\u001b[0msrc\u001b[0m\u001b[1;33m,\u001b[0m \u001b[0mreal_dst\u001b[0m\u001b[1;33m)\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0m\u001b[0;32m    792\u001b[0m     \u001b[1;32mexcept\u001b[0m \u001b[0mOSError\u001b[0m\u001b[1;33m:\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n",
+      "\u001b[1;31mPermissionError\u001b[0m: [WinError 32] O arquivo já está sendo usado por outro processo: 'C:\\\\Users\\\\gdutr\\\\.cache\\\\huggingface\\\\datasets\\\\squad_multitask\\\\highlight_qg_format\\\\1.0.0\\\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\\\tmpc1a8qr7c' -> 'C:\\\\Users\\\\gdutr\\\\.cache\\\\huggingface\\\\datasets\\\\squad_multitask\\\\highlight_qg_format\\\\1.0.0\\\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\\\cache-5ac1f5b88a8836dc0e712f2b9e291dbe.arrow'",
+      "\nDuring handling of the above exception, another exception occurred:\n",
+      "\u001b[1;31mPermissionError\u001b[0m                           Traceback (most recent call last)",
+      "\u001b[1;32m<ipython-input-14-2d486569fc19>\u001b[0m in \u001b[0;36m<module>\u001b[1;34m\u001b[0m\n\u001b[1;32m----> 1\u001b[1;33m \u001b[0mtrain_dataset\u001b[0m \u001b[1;33m=\u001b[0m \u001b[0mprocessor\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0mprocess\u001b[0m\u001b[1;33m(\u001b[0m\u001b[0mtrain_dataset\u001b[0m\u001b[1;33m)\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0m",
+      "\u001b[1;32m<ipython-input-12-345ce8ae98be>\u001b[0m in \u001b[0;36mprocess\u001b[1;34m(self, dataset)\u001b[0m\n\u001b[0;32m     18\u001b[0m             \u001b[0mdataset\u001b[0m \u001b[1;33m=\u001b[0m \u001b[0mdataset\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0mmap\u001b[0m\u001b[1;33m(\u001b[0m\u001b[0mself\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0m_add_eos_examples\u001b[0m\u001b[1;33m)\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0;32m     19\u001b[0m \u001b[1;33m\u001b[0m\u001b[0m\n\u001b[1;32m---> 20\u001b[1;33m         \u001b[0mdataset\u001b[0m \u001b[1;33m=\u001b[0m \u001b[0mdataset\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0mmap\u001b[0m\u001b[1;33m(\u001b[0m\u001b[0mself\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0m_add_special_tokens\u001b[0m\u001b[1;33m)\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0m\u001b[0;32m     21\u001b[0m         \u001b[0mdataset\u001b[0m \u001b[1;33m=\u001b[0m \u001b[0mdataset\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0mmap\u001b[0m\u001b[1;33m(\u001b[0m\u001b[0mself\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0m_convert_to_features\u001b[0m\u001b[1;33m,\u001b[0m \u001b[0mbatched\u001b[0m\u001b[1;33m=\u001b[0m\u001b[1;32mTrue\u001b[0m\u001b[1;33m)\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0;32m     22\u001b[0m \u001b[1;33m\u001b[0m\u001b[0m\n",
+      "\u001b[1;32m~\\miniconda3\\envs\\nlp-gpu\\lib\\site-packages\\nlp\\arrow_dataset.py\u001b[0m in \u001b[0;36mmap\u001b[1;34m(self, function, with_indices, batched, batch_size, remove_columns, keep_in_memory, load_from_cache_file, cache_file_name, writer_batch_size, features, disable_nullable, verbose)\u001b[0m\n\u001b[0;32m    968\u001b[0m \u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0;32m    969\u001b[0m         \u001b[1;32mif\u001b[0m \u001b[0mtmp_file\u001b[0m \u001b[1;32mis\u001b[0m \u001b[1;32mnot\u001b[0m \u001b[1;32mNone\u001b[0m\u001b[1;33m:\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[1;32m--> 970\u001b[1;33m             \u001b[0mshutil\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0mmove\u001b[0m\u001b[1;33m(\u001b[0m\u001b[0mtmp_file\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0mname\u001b[0m\u001b[1;33m,\u001b[0m \u001b[0mcache_file_name\u001b[0m\u001b[1;33m)\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0m\u001b[0;32m    971\u001b[0m \u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0;32m    972\u001b[0m         \u001b[1;32mif\u001b[0m \u001b[0mupdate_data\u001b[0m\u001b[1;33m:\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n",
+      "\u001b[1;32m~\\miniconda3\\envs\\nlp-gpu\\lib\\shutil.py\u001b[0m in \u001b[0;36mmove\u001b[1;34m(src, dst, copy_function)\u001b[0m\n\u001b[0;32m    804\u001b[0m         \u001b[1;32melse\u001b[0m\u001b[1;33m:\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0;32m    805\u001b[0m             \u001b[0mcopy_function\u001b[0m\u001b[1;33m(\u001b[0m\u001b[0msrc\u001b[0m\u001b[1;33m,\u001b[0m \u001b[0mreal_dst\u001b[0m\u001b[1;33m)\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[1;32m--> 806\u001b[1;33m             \u001b[0mos\u001b[0m\u001b[1;33m.\u001b[0m\u001b[0munlink\u001b[0m\u001b[1;33m(\u001b[0m\u001b[0msrc\u001b[0m\u001b[1;33m)\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0m\u001b[0;32m    807\u001b[0m     \u001b[1;32mreturn\u001b[0m \u001b[0mreal_dst\u001b[0m\u001b[1;33m\u001b[0m\u001b[1;33m\u001b[0m\u001b[0m\n\u001b[0;32m    808\u001b[0m \u001b[1;33m\u001b[0m\u001b[0m\n",
+      "\u001b[1;31mPermissionError\u001b[0m: [WinError 32] O arquivo já está sendo usado por outro processo: 'C:\\\\Users\\\\gdutr\\\\.cache\\\\huggingface\\\\datasets\\\\squad_multitask\\\\highlight_qg_format\\\\1.0.0\\\\79eda69e803ef0edf75970022ebdffc3b92a11d258088c947b94a6d01b2cddfd\\\\tmpc1a8qr7c'"
+     ]
+    }
+   ],
+   "source": [
+    "train_dataset = processor.process(train_dataset)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "valid_dataset = processor.process(valid_dataset)"
+   ]
+  }
+ ],
+ "metadata": {
+  "interpreter": {
+   "hash": "d98a242ac794090856e709806b29087f488f332a8741802de50a95a2014dd36b"
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3.8.8 64-bit ('nlp-gpu': conda)"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.8.8"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
